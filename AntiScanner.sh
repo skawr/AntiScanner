@@ -117,7 +117,7 @@ if curl -sSL --max-time 30 "$URL" -o "$TEMP_FILE" && [[ -s "$TEMP_FILE" ]]; then
         iptables-save > /etc/iptables/rules.v4
         ip6tables-save > /etc/iptables/rules.v6
     fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Список AntiScanner обновлён через $MODE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Список AntiScanner обновлён"
 else
     echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Не удалось скачать список AntiScanner, оставляю текущие правила без изменений"
 fi
