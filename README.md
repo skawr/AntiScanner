@@ -4,4 +4,4 @@
 
 # Использование
 
-**`bash <(curl -Ls https://raw.githubusercontent.com/sngvy/AntiScanner/refs/heads/main/AntiScanner.sh)`**
+**`bash <(curl -Ls https://raw.githubusercontent.com/skawr/AntiScanner/refs/heads/main/AntiScanner.sh)`**
