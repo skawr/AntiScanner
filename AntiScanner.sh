@@ -1,5 +1,5 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.1 (Zero-Downtime, Auto-Restore, TCP-Protect & Neighbors Block)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.3 (Zero-Downtime, TCP-Protect, Neighbors Block, Conntrack & Auto-Cleanup)
 
 if [ "$EUID" -ne 0 ]; then
     echo "Ошибка: Запустите от имени root (sudo)."
@@ -29,7 +29,7 @@ LOGROTATE_EOF
 
 SCRIPT_PATH="/usr/local/bin/update-antiscanner.sh"
 
-# 3. ГЕНЕРАЦИЯ СКРИПТА (Поддержка swap, флага --rules-only и новых защит)
+# 3. ГЕНЕРАЦИЯ СКРИПТА
 cat << 'EOF' > "$SCRIPT_PATH"
 #!/bin/bash
 URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
@@ -44,24 +44,17 @@ ipset create $IPSET_V4 hash:net family inet hashsize 1024 maxelem 100000 2>/dev/
 ipset create $IPSET_V6 hash:net family inet6 hashsize 1024 maxelem 100000 2>/dev/null
 ipset create $WHITELIST_V4 hash:net family inet 2>/dev/null
 
-# === АВТО-БЕЛЫЙ СПИСОК (Защита от самоблокировки) ===
+# === АВТО-БЕЛЫЙ СПИСОК ===
 ipset flush $WHITELIST_V4 2>/dev/null
-
-# Авто-определение шлюза по умолчанию
 VPS_GW=$(ip -4 route | grep default | awk '{print $3}')
 [[ -n "$VPS_GW" ]] && ipset add $WHITELIST_V4 "$VPS_GW" 2>/dev/null
-
-# Авто-определение DNS серверов
 grep nameserver /etc/resolv.conf | awk '{print $2}' | grep -E '^[0-9.]+$' | while read -r dns; do
     ipset add $WHITELIST_V4 "$dns" 2>/dev/null
 done
-# ====================================================
 
-# Если скрипт запущен БЕЗ флага --rules-only, скачиваем базы и вычисляем соседей
+# === СКАЧИВАНИЕ И ОБНОВЛЕНИЕ БАЗ ===
 if [[ "$1" != "--rules-only" ]]; then
     TEMP_FILE=$(mktemp)
-    
-    # Создаем/очищаем временные сеты
     ipset create $TEMP_V4 hash:net family inet hashsize 1024 maxelem 100000 2>/dev/null || ipset flush $TEMP_V4
     ipset create $TEMP_V6 hash:net family inet6 hashsize 1024 maxelem 100000 2>/dev/null || ipset flush $TEMP_V6
 
@@ -76,7 +69,7 @@ if [[ "$1" != "--rules-only" ]]; then
             fi
         done < "$TEMP_FILE"
 
-        # --- БЛОК ЗАЩИТЫ ОТ СОСЕДЕЙ ПО ХОСТИНГУ (+/- 500 IP) ---
+        # Блок защиты от соседей
         ip2int() { local a b c d; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
         int2ip() { local ui32=$1; local ip n; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
 
@@ -85,26 +78,27 @@ if [[ "$1" != "--rules-only" ]]; then
             IP_INT=$(ip2int "$VPS_IP")
             START_IP=$(int2ip $((IP_INT - 500)))
             END_IP=$(int2ip $((IP_INT + 500)))
-            
             ipset add $TEMP_V4 $START_IP-$END_IP 2>/dev/null
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Заблокирована подсеть соседей: $START_IP - $END_IP"
         fi
-        # -------------------------------------------------------
 
-        # Бесшовный swap (Zero-Downtime)
         ipset swap $TEMP_V4 $IPSET_V4
         ipset swap $TEMP_V6 $IPSET_V6
-        
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы IP-адресов скачаны и обновлены (SWAP)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы IP-адресов обновлены"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Не удалось скачать список. Используются старые базы."
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Не удалось скачать список."
     fi
-    
-    # Удаляем временный мусор
     ipset destroy $TEMP_V4 2>/dev/null
     ipset destroy $TEMP_V6 2>/dev/null
     rm -f "$TEMP_FILE"
 fi
+
+# === ОЧИСТКА ЛЕГАСИ (Удаление старых цепочек от предыдущих версий) ===
+for cmd in iptables ip6tables; do
+    $cmd -D INPUT -j SCANNERS-BLOCK 2>/dev/null
+    $cmd -D DOCKER-USER -j SCANNERS-BLOCK 2>/dev/null
+    $cmd -F SCANNERS-BLOCK 2>/dev/null
+    $cmd -X SCANNERS-BLOCK 2>/dev/null
+done
 
 # === ЗАЩИТА ОТ АНОМАЛЬНЫХ TCP-ФЛАГОВ ===
 for cmd in iptables ip6tables; do
@@ -121,23 +115,26 @@ for cmd in iptables ip6tables; do
 done
 
 # === ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES ===
-# 1. Очищаем старые правила (защита от дублей при обновлениях)
 for cmd in iptables ip6tables; do
+    $cmd -D INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     $cmd -D INPUT -j TCP-FLAGS-PROTECT 2>/dev/null
     $cmd -D INPUT -m set --match-set $IPSET_V4 src -j DROP 2>/dev/null
     $cmd -D INPUT -m set --match-set $IPSET_V6 src -j DROP 2>/dev/null
     $cmd -D INPUT -m set --match-set $WHITELIST_V4 src -j RETURN 2>/dev/null
 done
 
-# 2. INPUT: Ставим правила в обратном порядке (флаг -I 1 ставит на самый верх)
+# Расстановка приоритетов (обратный порядок вставки)
 iptables -I INPUT 1 -m set --match-set $IPSET_V4 src -j DROP
 ip6tables -I INPUT 1 -m set --match-set $IPSET_V6 src -j DROP
 iptables -I INPUT 1 -m set --match-set $WHITELIST_V4 src -j RETURN
 iptables -I INPUT 1 -j TCP-FLAGS-PROTECT
 ip6tables -I INPUT 1 -j TCP-FLAGS-PROTECT
+iptables -I INPUT 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+ip6tables -I INPUT 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-# 3. DOCKER-USER (защита контейнеров)
+# DOCKER-USER
 if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+    iptables -D DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     iptables -D DOCKER-USER -j TCP-FLAGS-PROTECT 2>/dev/null
     iptables -D DOCKER-USER -m set --match-set $IPSET_V4 src -j DROP 2>/dev/null
     iptables -D DOCKER-USER -m set --match-set $WHITELIST_V4 src -j RETURN 2>/dev/null
@@ -145,46 +142,33 @@ if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
     iptables -I DOCKER-USER 1 -m set --match-set $IPSET_V4 src -j DROP
     iptables -I DOCKER-USER 1 -m set --match-set $WHITELIST_V4 src -j RETURN
     iptables -I DOCKER-USER 1 -j TCP-FLAGS-PROTECT
+    iptables -I DOCKER-USER 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 fi
 
 if ip6tables -L DOCKER-USER -n >/dev/null 2>&1; then
+    ip6tables -D DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     ip6tables -D DOCKER-USER -j TCP-FLAGS-PROTECT 2>/dev/null
     ip6tables -D DOCKER-USER -m set --match-set $IPSET_V6 src -j DROP 2>/dev/null
     
     ip6tables -I DOCKER-USER 1 -m set --match-set $IPSET_V6 src -j DROP
     ip6tables -I DOCKER-USER 1 -j TCP-FLAGS-PROTECT
-fi
-
-if [[ "$1" == "--rules-only" ]]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Правила iptables/UFW восстановлены после перезапуска службы."
+    ip6tables -I DOCKER-USER 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 fi
 EOF
 
 chmod +x "$SCRIPT_PATH"
 
-# 4. Настройка Cron (Очистка старых записей и добавление новой)
+# 4. Настройка Cron
 crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
 C_JOB="20 3 * * * $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1"
 (crontab -l 2>/dev/null; echo "$C_JOB") | crontab -
 
-# 5. Интеграция с Systemd (Авто-восстановление при рестарте сервисов)
-echo "Настройка хуков для UFW и Docker..."
+# 5. Интеграция с Systemd
+echo "Настройка хуков..."
+mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/ufw.service.d
+echo -e "[Service]\nExecStartPost=-$SCRIPT_PATH --rules-only" > /etc/systemd/system/docker.service.d/antiscanner-hook.conf
+echo -e "[Service]\nExecStartPost=-$SCRIPT_PATH --rules-only" > /etc/systemd/system/ufw.service.d/antiscanner-hook.conf
 
-# Хук для Docker
-mkdir -p /etc/systemd/system/docker.service.d
-cat << EOF_DOCKER > /etc/systemd/system/docker.service.d/antiscanner-hook.conf
-[Service]
-ExecStartPost=-$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1
-EOF_DOCKER
-
-# Хук для UFW
-mkdir -p /etc/systemd/system/ufw.service.d
-cat << EOF_UFW > /etc/systemd/system/ufw.service.d/antiscanner-hook.conf
-[Service]
-ExecStartPost=-$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1
-EOF_UFW
-
-# Основной юнит для загрузки сервера
 cat << EOF_SYS > /etc/systemd/system/antiscanner-update.service
 [Unit]
 Description=Update AntiScanner Blocklist on Boot
@@ -199,12 +183,10 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_SYS
 
-# 6. Безопасное обновление сервисов
 systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
-# 7. Первый запуск (или применение обновления)
+# 6. Применение
 echo "Применение актуальных баз и правил..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
-
-echo "Установка/Обновление успешно завершено! Защита полностью автоматизирована."
+echo "Установка/Обновление успешно завершено!"
