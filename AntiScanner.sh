@@ -1,5 +1,5 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.5.3 (Production Final: Safe Init, Strict IPv6, Adaptive Limits)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.5.6 (Clean Architecture, Redundant DNS Fallback Removed)
 
 set -Eeuo pipefail
 
@@ -13,7 +13,7 @@ if ! command -v apt-get >/dev/null; then
     exit 1
 fi
 
-echo "Установка/Обновление AntiScanner V3.5.3..."
+echo "Установка/Обновление AntiScanner V3.5.6..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y ipset curl logrotate mawk iptables util-linux -qq
@@ -53,9 +53,9 @@ MAX_DROP_PERCENT=50
 MIN_V6_RECORDS=0 # Установите реальный минимум (например, 50), если IPv6-база для вас критична
 MAX_DROP_PERCENT_V6=50
 
+# Блокировка SNI-сканеров от соседей по дата-центру
 ENABLE_NEIGHBOR_BLOCK=true
 NEIGHBOR_RANGE=500
-ENABLE_DNS_FALLBACK=true # Установите false для KVM/Dedicated серверов (закрывает уязвимость source-port 53)
 
 if (( MAX_DROP_PERCENT < 0 || MAX_DROP_PERCENT >= 100 || MAX_DROP_PERCENT_V6 < 0 || MAX_DROP_PERCENT_V6 >= 100 )); then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] MAX_DROP_PERCENT должен быть от 0 до 99." >> /var/log/antiscanner_update.log
@@ -141,6 +141,8 @@ if [[ "$VPS_GW6" == *:* ]]; then
 fi
 
 grep nameserver /etc/resolv.conf | mawk '{print $2}' | while read -r dns; do
+    # Очистка от суффиксов интерфейса (например, fe80::1%eth0 -> fe80::1)
+    dns="${dns%%%*}"
     if [[ "$dns" =~ : ]]; then
         ipset add "$WHITELIST_V6" "$dns" 2>/dev/null || true
     elif [[ "$dns" =~ \. ]]; then
@@ -184,13 +186,13 @@ if [[ "${1:-}" != "--rules-only" ]]; then
     API_URL="https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr"
     KEYWORDS="censys|shodan|paloalto|shadowserver|driftnet|onyphe|zoomeye|leakix|rapid7|fofa|quake"
     
-    HTTP_CODE=$(curl -s -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.5.3" --max-time 15 "$API_URL" || true)
+    HTTP_CODE=$(curl -s -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.5.6" --max-time 15 "$API_URL" || true)
     if [[ "$HTTP_CODE" == "200" ]]; then
         SUCCESS_DL=0
         FAIL_DL=0
         
         while read -r url; do
-            if curl -sSLf -H "User-Agent: AntiScanner-V3.5.3" --max-time 15 "$url" > "$TMP_DL"; then
+            if curl -sSLf -H "User-Agent: AntiScanner-V3.5.6" --max-time 15 "$url" > "$TMP_DL"; then
                 cat "$TMP_DL" >> "$TEMP_LIST"
                 ((SUCCESS_DL+=1))
             else
@@ -258,7 +260,6 @@ if [[ "${1:-}" != "--rules-only" ]]; then
         [[ -z "$ACTUAL_V4_COUNT" ]] && ACTUAL_V4_COUNT=0
         [[ -z "$ACTUAL_V6_COUNT" ]] && ACTUAL_V6_COUNT=0
 
-        # Хард-лимиты
         if (( ACTUAL_V4_COUNT < MIN_V4_RECORDS )); then
             log "[ERROR] Размер IPv4 базы ($ACTUAL_V4_COUNT) ниже минимума ($MIN_V4_RECORDS). Откат."
             exit 1
@@ -268,7 +269,6 @@ if [[ "${1:-}" != "--rules-only" ]]; then
             exit 1
         fi
 
-        # Софт-лимиты
         if (( OLD_V4_COUNT > MIN_V4_RECORDS )); then
             MIN_ALLOWED_V4=$(( OLD_V4_COUNT * (100 - MAX_DROP_PERCENT) / 100 ))
             if (( ACTUAL_V4_COUNT < MIN_ALLOWED_V4 )); then
@@ -355,24 +355,13 @@ done
 for cmd in iptables ip6tables; do
     $cmd -A "$CHAIN_MAIN" -i lo -j ACCEPT
     
-    if [ "$ENABLE_DNS_FALLBACK" = true ]; then
-        # Emergency DNS fallback for environments with unreliable conntrack
-        # (OpenVZ/LXC providers may evict UDP conntrack entries under load).
-        $cmd -A "$CHAIN_MAIN" -p udp --sport 53 -j ACCEPT
-        $cmd -A "$CHAIN_MAIN" -p tcp --sport 53 -j ACCEPT
-    fi
-
     if [ "$cmd" = "iptables" ]; then
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V4" src -j ACCEPT
-    else
-        $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V6" src -j ACCEPT
-    fi
-
-    $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
-
-    if [ "$cmd" = "iptables" ]; then
+        $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$IPSET_V4" src -j DROP
     else
+        $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V6" src -j ACCEPT
+        $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$IPSET_V6" src -j DROP
     fi
 
@@ -428,6 +417,6 @@ EOF_SYS
 systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
-echo "Запуск обновления V3.5.3..."
+echo "Запуск обновления V3.5.6..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
-echo "Установка AntiScanner V3.5.3 завершена!"
+echo "Установка AntiScanner V3.5.6 завершена!"
