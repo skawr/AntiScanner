@@ -1,15 +1,15 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.6 (Zero-Downtime, TCP-Protect, Smart OpenFilters API & Auto-Cleanup)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.7 (Zero-Downtime, TCP-Protect, OpenFilters, Bulk Restore & IPv6-WhiteList)
 
 if [ "$EUID" -ne 0 ]; then
     echo "Ошибка: Запустите от имени root (sudo)."
     exit 1
 fi
 
-echo "Обновление/Установка гибридного AntiScanner (с динамическим API OpenFilters)..."
+echo "Обновление/Установка гибридного AntiScanner (Версия 2.7 Оптимизированная)..."
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && apt-get install -y ipset curl logrotate -qq
+apt-get update -qq && apt-get install -y ipset curl logrotate awk -qq
 if dpkg -l | grep -q iptables-persistent; then
     apt-get purge -y iptables-persistent -qq
 fi
@@ -35,52 +35,63 @@ IPSET_V6="SCANNERS-BLOCK-V6"
 TEMP_V4="${IPSET_V4}-TEMP"
 TEMP_V6="${IPSET_V6}-TEMP"
 WHITELIST_V4="WHITELIST-V4"
+WHITELIST_V6="WHITELIST-V6"
 
-# Увеличен лимит maxelem до 500000 из-за большого объема баз
-ipset create $IPSET_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null
-ipset create $IPSET_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null
+# Оптимизированный hashsize (131072) предотвращает зависания при resize большой базы
+ipset create $IPSET_V4 hash:net family inet hashsize 131072 maxelem 500000 2>/dev/null
+ipset create $IPSET_V6 hash:net family inet6 hashsize 131072 maxelem 500000 2>/dev/null
 ipset create $WHITELIST_V4 hash:net family inet 2>/dev/null
+ipset create $WHITELIST_V6 hash:net family inet6 2>/dev/null
 
-# === АВТО-БЕЛЫЙ СПИСОК ===
+# === АВТО-БЕЛЫЙ СПИСОК (IPv4 + IPv6) ===
 ipset flush $WHITELIST_V4 2>/dev/null
+ipset flush $WHITELIST_V6 2>/dev/null
+
 VPS_GW=$(ip -4 route | grep default | awk '{print $3}')
 [[ -n "$VPS_GW" ]] && ipset add $WHITELIST_V4 "$VPS_GW" 2>/dev/null
-grep nameserver /etc/resolv.conf | awk '{print $2}' | grep -E '^[0-9.]+$' | while read -r dns; do
-    ipset add $WHITELIST_V4 "$dns" 2>/dev/null
+
+grep nameserver /etc/resolv.conf | awk '{print $2}' | while read -r dns; do
+    if [[ "$dns" =~ : ]]; then
+        ipset add $WHITELIST_V6 "$dns" 2>/dev/null
+    elif [[ "$dns" =~ \. ]]; then
+        ipset add $WHITELIST_V4 "$dns" 2>/dev/null
+    fi
 done
 
 # === СКАЧИВАНИЕ И ОБНОВЛЕНИЕ БАЗ ===
 if [[ "$1" != "--rules-only" ]]; then
     TEMP_FILE=$(mktemp)
-    ipset create $TEMP_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V4
-    ipset create $TEMP_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V6
+    RESTORE_FILE=$(mktemp)
+    
+    ipset create $TEMP_V4 hash:net family inet hashsize 131072 maxelem 500000 2>/dev/null || ipset flush $TEMP_V4
+    ipset create $TEMP_V6 hash:net family inet6 hashsize 131072 maxelem 500000 2>/dev/null || ipset flush $TEMP_V6
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Загрузка баз IP-адресов..."
     
-    # 1. Загрузка базового Gist-списка
-    curl -sSLf --max-time 30 "$URL" >> "$TEMP_FILE" 2>/dev/null
+    # 1. Загрузка Gist
+    curl -sSLf --user-agent "Mozilla/5.0" --max-time 30 "$URL" >> "$TEMP_FILE" 2>/dev/null
 
-    # 2. Динамическая загрузка OpenFilters через API GitHub
+    # 2. Динамическая загрузка OpenFilters
     API_URL="https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr"
     KEYWORDS="censys|shodan|paloalto|shadowserver|driftnet|onyphe|zoomeye|leakix|rapid7|fofa|quake"
     
-    # Парсим JSON ответа API, достаем прямые ссылки и фильтруем по ключевым словам
-    curl -sSL --max-time 15 "$API_URL" | grep '"download_url":' | awk -F '"' '{print $4}' | grep -iE "($KEYWORDS)" | while read -r url; do
-        curl -sSL --max-time 15 "$url" >> "$TEMP_FILE" 2>/dev/null
+    curl -sSL --user-agent "Mozilla/5.0 (Linux; AntiScanner V2.7)" --max-time 15 "$API_URL" | \
+    grep '"download_url":' | awk -F '"' '{print $4}' | grep -iE "($KEYWORDS)" | while read -r url; do
+        curl -sSL --user-agent "Mozilla/5.0" --max-time 15 "$url" >> "$TEMP_FILE" 2>/dev/null
     done
 
-    # 3. Обработка собранного файла
+    # 3. Мгновенная пакетная загрузка в ядро (Bulk Restore)
     if [[ -s "$TEMP_FILE" ]]; then
-        while IFS= read -r subnet; do
-            subnet=$(echo "$subnet" | awk '{print $1}') 
-            [[ -z "$subnet" || "$subnet" == "#"* || "$subnet" == "<"* ]] && continue
-            
-            if [[ "$subnet" =~ : ]]; then
-                ipset add $TEMP_V6 "$subnet" 2>/dev/null
-            else
-                ipset add $TEMP_V4 "$subnet" 2>/dev/null
-            fi
-        done < "$TEMP_FILE"
+        # AWK мгновенно сортирует мусор и создает команды для ipset restore
+        awk '{
+            sub(/#.*/, "")
+            sub(/<.*/, "")
+            if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
+                print "add '"$TEMP_V4"' " $1
+            } else if ($1 ~ /:/) {
+                print "add '"$TEMP_V6"' " $1
+            }
+        }' "$TEMP_FILE" > "$RESTORE_FILE"
 
         # Блок защиты от соседей
         ip2int() { local a b c d; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
@@ -91,19 +102,22 @@ if [[ "$1" != "--rules-only" ]]; then
             IP_INT=$(ip2int "$VPS_IP")
             START_IP=$(int2ip $((IP_INT - 500)))
             END_IP=$(int2ip $((IP_INT + 500)))
-            ipset add $TEMP_V4 $START_IP-$END_IP 2>/dev/null
+            echo "add $TEMP_V4 $START_IP-$END_IP" >> "$RESTORE_FILE"
         fi
+
+        # Применяем весь огромный список одним запросом к ядру (-! игнорирует дубликаты)
+        ipset restore -! < "$RESTORE_FILE"
 
         ipset swap $TEMP_V4 $IPSET_V4
         ipset swap $TEMP_V6 $IPSET_V6
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы сканеров успешно обновлены (API Fetch)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы сканеров успешно обновлены (Bulk Restore)"
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Ошибка скачивания списков."
     fi
     
     ipset destroy $TEMP_V4 2>/dev/null
     ipset destroy $TEMP_V6 2>/dev/null
-    rm -f "$TEMP_FILE"
+    rm -f "$TEMP_FILE" "$RESTORE_FILE"
 fi
 
 # === ОЧИСТКА ЛЕГАСИ ===
@@ -139,10 +153,12 @@ for cmd in iptables ip6tables; do
     $cmd -D INPUT -m set --match-set $IPSET_V6 src -j DROP 2>/dev/null
     $cmd -D INPUT -m set --match-set $WHITELIST_V4 src -j RETURN 2>/dev/null
 done
+ip6tables -D INPUT -m set --match-set $WHITELIST_V6 src -j RETURN 2>/dev/null
 
 iptables -I INPUT 1 -m set --match-set $IPSET_V4 src -j DROP
 ip6tables -I INPUT 1 -m set --match-set $IPSET_V6 src -j DROP
 iptables -I INPUT 1 -m set --match-set $WHITELIST_V4 src -j RETURN
+ip6tables -I INPUT 1 -m set --match-set $WHITELIST_V6 src -j RETURN
 
 iptables -I INPUT 1 -j TCP-FLAGS-PROTECT
 ip6tables -I INPUT 1 -j TCP-FLAGS-PROTECT
@@ -174,8 +190,10 @@ if ip6tables -L DOCKER-USER -n >/dev/null 2>&1; then
     ip6tables -D DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     ip6tables -D DOCKER-USER -j TCP-FLAGS-PROTECT 2>/dev/null
     ip6tables -D DOCKER-USER -m set --match-set $IPSET_V6 src -j DROP 2>/dev/null
+    ip6tables -D DOCKER-USER -m set --match-set $WHITELIST_V6 src -j RETURN 2>/dev/null
     
     ip6tables -I DOCKER-USER 1 -m set --match-set $IPSET_V6 src -j DROP
+    ip6tables -I DOCKER-USER 1 -m set --match-set $WHITELIST_V6 src -j RETURN
     ip6tables -I DOCKER-USER 1 -j TCP-FLAGS-PROTECT
     ip6tables -I DOCKER-USER 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 fi
@@ -212,6 +230,6 @@ systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
 # 6. Применение
-echo "Сбор баз через API (может занять 10-15 секунд) и применение правил..."
+echo "Сбор баз через API и моментальное применение правил (Bulk Restore)..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
 echo "Установка/Обновление успешно завершено!"
