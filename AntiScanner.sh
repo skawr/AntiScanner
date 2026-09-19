@@ -1,5 +1,5 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.5.7 (Mawk Regex Fix)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.5.8 (Unbound Variable Fix, Bulletproof JSON Parsing)
 
 set -Eeuo pipefail
 
@@ -13,7 +13,7 @@ if ! command -v apt-get >/dev/null; then
     exit 1
 fi
 
-echo "Установка/Обновление AntiScanner V3.5.7..."
+echo "Установка/Обновление AntiScanner V3.5.8..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y ipset curl logrotate mawk iptables util-linux -qq
@@ -50,7 +50,7 @@ fi
 URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
 MIN_V4_RECORDS=1000
 MAX_DROP_PERCENT=50
-MIN_V6_RECORDS=0
+MIN_V6_RECORDS=0 # Установите реальный минимум (например, 50), если IPv6-база для вас критична
 MAX_DROP_PERCENT_V6=50
 
 # Блокировка SNI-сканеров от соседей по дата-центру
@@ -91,7 +91,7 @@ validate_ipset_type() {
     local expected_family=$2
 
     if ipset list "$set_name" >/dev/null 2>&1; then
-        local type family
+        local type="" family=""
         type=$(ipset list "$set_name" | mawk '/^Type:/ {print $2; exit}' || true)
         family=$(ipset list "$set_name" | mawk '
             /^Header:/ {
@@ -185,20 +185,20 @@ if [[ "${1:-}" != "--rules-only" ]]; then
     API_URL="https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr"
     KEYWORDS="censys|shodan|paloalto|shadowserver|driftnet|onyphe|zoomeye|leakix|rapid7|fofa|quake"
     
-    HTTP_CODE=$(curl -s -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.5.7" --max-time 15 "$API_URL" || true)
+    HTTP_CODE=$(curl -sSL -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.5.8" --max-time 15 "$API_URL" || true)
     if [[ "$HTTP_CODE" == "200" ]]; then
         SUCCESS_DL=0
         FAIL_DL=0
         
         while read -r url; do
-            if curl -sSLf -H "User-Agent: AntiScanner-V3.5.7" --max-time 15 "$url" > "$TMP_DL"; then
+            if curl -sSLf -H "User-Agent: AntiScanner-V3.5.8" --max-time 15 "$url" > "$TMP_DL"; then
                 cat "$TMP_DL" >> "$TEMP_LIST"
                 ((SUCCESS_DL+=1))
             else
                 ((FAIL_DL+=1))
             fi
             : > "$TMP_DL"
-        done < <(mawk -F '"' '/"download_url":/ {print $4}' "$API_RESP" | grep -iE "($KEYWORDS)")
+        done < <(grep -Eo '"download_url":[[:space:]]*"[^"]+"' "$API_RESP" | cut -d '"' -f 4 | grep -iE "($KEYWORDS)" || true)
         
         log "[INFO] OpenFilters: $SUCCESS_DL файлов загружено, $FAIL_DL не удалось."
     else
@@ -231,8 +231,8 @@ if [[ "${1:-}" != "--rules-only" ]]; then
     }' "$TEMP_LIST" > "$RESTORE_FILE"
 
     if [ "$ENABLE_NEIGHBOR_BLOCK" = true ]; then
-        ip2int() { local a b c d; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
-        int2ip() { local ui32=$1; local ip n; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
+        ip2int() { local a=0 b=0 c=0 d=0; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
+        int2ip() { local ui32=$1; local ip="" n=0; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
 
         VPS_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)
         if [[ -n "$VPS_IP" ]]; then
@@ -356,15 +356,11 @@ for cmd in iptables ip6tables; do
     
     if [ "$cmd" = "iptables" ]; then
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V4" src -j ACCEPT
-    else
-        $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V6" src -j ACCEPT
-    fi
-
-    $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
-
-    if [ "$cmd" = "iptables" ]; then
+        $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$IPSET_V4" src -j DROP
     else
+        $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V6" src -j ACCEPT
+        $cmd -A "$CHAIN_MAIN" -p tcp -j "$CHAIN_TCP"
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$IPSET_V6" src -j DROP
     fi
 
@@ -420,6 +416,6 @@ EOF_SYS
 systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
-echo "Запуск обновления V3.5.7..."
+echo "Запуск обновления V3.5.8..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
-echo "Установка AntiScanner V3.5.7 завершена!"
+echo "Установка AntiScanner V3.5.8 завершена!"
