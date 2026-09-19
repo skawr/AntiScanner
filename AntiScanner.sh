@@ -1,21 +1,19 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.3 (Zero-Downtime, TCP-Protect, Neighbors Block, Conntrack & Auto-Cleanup)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.5 (Zero-Downtime, TCP-Protect, OpenFilters Scanners & Auto-Cleanup)
 
 if [ "$EUID" -ne 0 ]; then
     echo "Ошибка: Запустите от имени root (sudo)."
     exit 1
 fi
 
-echo "Обновление/Установка гибридного AntiScanner..."
+echo "Обновление/Установка гибридного AntiScanner (с поддержкой OpenFilters)..."
 
-# 1. Установка пакетов и чистка
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y ipset curl logrotate -qq
 if dpkg -l | grep -q iptables-persistent; then
     apt-get purge -y iptables-persistent -qq
 fi
 
-# 2. Настройка логов
 cat << 'LOGROTATE_EOF' > /etc/logrotate.d/antiscanner
 /var/log/antiscanner_update.log {
     daily
@@ -29,7 +27,6 @@ LOGROTATE_EOF
 
 SCRIPT_PATH="/usr/local/bin/update-antiscanner.sh"
 
-# 3. ГЕНЕРАЦИЯ СКРИПТА
 cat << 'EOF' > "$SCRIPT_PATH"
 #!/bin/bash
 URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
@@ -39,9 +36,9 @@ TEMP_V4="${IPSET_V4}-TEMP"
 TEMP_V6="${IPSET_V6}-TEMP"
 WHITELIST_V4="WHITELIST-V4"
 
-# Гарантируем, что базовые сеты существуют
-ipset create $IPSET_V4 hash:net family inet hashsize 1024 maxelem 100000 2>/dev/null
-ipset create $IPSET_V6 hash:net family inet6 hashsize 1024 maxelem 100000 2>/dev/null
+# Увеличен лимит maxelem до 500000 из-за большого объема баз OpenFilters
+ipset create $IPSET_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null
+ipset create $IPSET_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null
 ipset create $WHITELIST_V4 hash:net family inet 2>/dev/null
 
 # === АВТО-БЕЛЫЙ СПИСОК ===
@@ -55,13 +52,33 @@ done
 # === СКАЧИВАНИЕ И ОБНОВЛЕНИЕ БАЗ ===
 if [[ "$1" != "--rules-only" ]]; then
     TEMP_FILE=$(mktemp)
-    ipset create $TEMP_V4 hash:net family inet hashsize 1024 maxelem 100000 2>/dev/null || ipset flush $TEMP_V4
-    ipset create $TEMP_V6 hash:net family inet6 hashsize 1024 maxelem 100000 2>/dev/null || ipset flush $TEMP_V6
+    ipset create $TEMP_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V4
+    ipset create $TEMP_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V6
 
-    if curl -sSL --max-time 30 "$URL" -o "$TEMP_FILE" && [[ -s "$TEMP_FILE" ]]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Загрузка баз..."
+    
+    # 1. Загрузка базового Gist-списка
+    curl -sSLf --max-time 30 "$URL" >> "$TEMP_FILE" 2>/dev/null
+
+    # 2. Загрузка аналитических сканеров (OpenFilters)
+    SCANNERS=("censys" "shodan" "paloalto" "shadowserver" "driftnet" "onyphe" "zoomeye" "leakix" "rapid7" "fofa" "quake")
+    
+    for scanner in "${SCANNERS[@]}"; do
+        # Пробуем скачать IPv4 (с постфиксом _v4.txt или просто .txt)
+        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}_v4.txt" >> "$TEMP_FILE" 2>/dev/null || \
+        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}.txt" >> "$TEMP_FILE" 2>/dev/null
+        
+        # Пробуем скачать IPv6
+        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}_v6.txt" >> "$TEMP_FILE" 2>/dev/null
+    done
+
+    # 3. Обработка собранного файла
+    if [[ -s "$TEMP_FILE" ]]; then
         while IFS= read -r subnet; do
-            subnet=$(echo "$subnet" | xargs)
-            [[ -z "$subnet" || "$subnet" == "#"* ]] && continue
+            # Очистка от пробелов и инлайн-комментариев
+            subnet=$(echo "$subnet" | awk '{print $1}') 
+            [[ -z "$subnet" || "$subnet" == "#"* || "$subnet" == "<"* ]] && continue
+            
             if [[ "$subnet" =~ : ]]; then
                 ipset add $TEMP_V6 "$subnet" 2>/dev/null
             else
@@ -69,7 +86,7 @@ if [[ "$1" != "--rules-only" ]]; then
             fi
         done < "$TEMP_FILE"
 
-        # Блок защиты от соседей
+        # Блок защиты от соседей (+/- 500 IP)
         ip2int() { local a b c d; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
         int2ip() { local ui32=$1; local ip n; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
 
@@ -83,16 +100,17 @@ if [[ "$1" != "--rules-only" ]]; then
 
         ipset swap $TEMP_V4 $IPSET_V4
         ipset swap $TEMP_V6 $IPSET_V6
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы IP-адресов обновлены"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы сканеров успешно обновлены и применены (SWAP)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Не удалось скачать список."
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Ошибка скачивания списков. Сохранены старые правила."
     fi
+    
     ipset destroy $TEMP_V4 2>/dev/null
     ipset destroy $TEMP_V6 2>/dev/null
     rm -f "$TEMP_FILE"
 fi
 
-# === ОЧИСТКА ЛЕГАСИ (Удаление старых цепочек от предыдущих версий) ===
+# === ОЧИСТКА ЛЕГАСИ ===
 for cmd in iptables ip6tables; do
     $cmd -D INPUT -j SCANNERS-BLOCK 2>/dev/null
     $cmd -D DOCKER-USER -j SCANNERS-BLOCK 2>/dev/null
@@ -116,6 +134,9 @@ done
 
 # === ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES ===
 for cmd in iptables ip6tables; do
+    $cmd -D INPUT -i lo -j ACCEPT 2>/dev/null
+    $cmd -D INPUT -p udp --sport 53 -j ACCEPT 2>/dev/null
+    $cmd -D INPUT -p tcp --sport 53 -j ACCEPT 2>/dev/null
     $cmd -D INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
     $cmd -D INPUT -j TCP-FLAGS-PROTECT 2>/dev/null
     $cmd -D INPUT -m set --match-set $IPSET_V4 src -j DROP 2>/dev/null
@@ -123,14 +144,22 @@ for cmd in iptables ip6tables; do
     $cmd -D INPUT -m set --match-set $WHITELIST_V4 src -j RETURN 2>/dev/null
 done
 
-# Расстановка приоритетов (обратный порядок вставки)
 iptables -I INPUT 1 -m set --match-set $IPSET_V4 src -j DROP
 ip6tables -I INPUT 1 -m set --match-set $IPSET_V6 src -j DROP
 iptables -I INPUT 1 -m set --match-set $WHITELIST_V4 src -j RETURN
+
 iptables -I INPUT 1 -j TCP-FLAGS-PROTECT
 ip6tables -I INPUT 1 -j TCP-FLAGS-PROTECT
+
 iptables -I INPUT 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 ip6tables -I INPUT 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+iptables -I INPUT 1 -p tcp --sport 53 -j ACCEPT
+ip6tables -I INPUT 1 -p tcp --sport 53 -j ACCEPT
+iptables -I INPUT 1 -p udp --sport 53 -j ACCEPT
+ip6tables -I INPUT 1 -p udp --sport 53 -j ACCEPT
+iptables -I INPUT 1 -i lo -j ACCEPT
+ip6tables -I INPUT 1 -i lo -j ACCEPT
 
 # DOCKER-USER
 if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
@@ -187,6 +216,6 @@ systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
 # 6. Применение
-echo "Применение актуальных баз и правил..."
+echo "Скачивание баз (это займет несколько секунд) и применение правил..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
 echo "Установка/Обновление успешно завершено!"
