@@ -1,12 +1,12 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.5 (Zero-Downtime, TCP-Protect, OpenFilters Scanners & Auto-Cleanup)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V2.6 (Zero-Downtime, TCP-Protect, Smart OpenFilters API & Auto-Cleanup)
 
 if [ "$EUID" -ne 0 ]; then
     echo "Ошибка: Запустите от имени root (sudo)."
     exit 1
 fi
 
-echo "Обновление/Установка гибридного AntiScanner (с поддержкой OpenFilters)..."
+echo "Обновление/Установка гибридного AntiScanner (с динамическим API OpenFilters)..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y ipset curl logrotate -qq
@@ -36,7 +36,7 @@ TEMP_V4="${IPSET_V4}-TEMP"
 TEMP_V6="${IPSET_V6}-TEMP"
 WHITELIST_V4="WHITELIST-V4"
 
-# Увеличен лимит maxelem до 500000 из-за большого объема баз OpenFilters
+# Увеличен лимит maxelem до 500000 из-за большого объема баз
 ipset create $IPSET_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null
 ipset create $IPSET_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null
 ipset create $WHITELIST_V4 hash:net family inet 2>/dev/null
@@ -55,27 +55,23 @@ if [[ "$1" != "--rules-only" ]]; then
     ipset create $TEMP_V4 hash:net family inet hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V4
     ipset create $TEMP_V6 hash:net family inet6 hashsize 4096 maxelem 500000 2>/dev/null || ipset flush $TEMP_V6
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Загрузка баз..."
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Загрузка баз IP-адресов..."
     
     # 1. Загрузка базового Gist-списка
     curl -sSLf --max-time 30 "$URL" >> "$TEMP_FILE" 2>/dev/null
 
-    # 2. Загрузка аналитических сканеров (OpenFilters)
-    SCANNERS=("censys" "shodan" "paloalto" "shadowserver" "driftnet" "onyphe" "zoomeye" "leakix" "rapid7" "fofa" "quake")
+    # 2. Динамическая загрузка OpenFilters через API GitHub
+    API_URL="https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr"
+    KEYWORDS="censys|shodan|paloalto|shadowserver|driftnet|onyphe|zoomeye|leakix|rapid7|fofa|quake"
     
-    for scanner in "${SCANNERS[@]}"; do
-        # Пробуем скачать IPv4 (с постфиксом _v4.txt или просто .txt)
-        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}_v4.txt" >> "$TEMP_FILE" 2>/dev/null || \
-        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}.txt" >> "$TEMP_FILE" 2>/dev/null
-        
-        # Пробуем скачать IPv6
-        curl -sSLf --max-time 10 "https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/${scanner}_v6.txt" >> "$TEMP_FILE" 2>/dev/null
+    # Парсим JSON ответа API, достаем прямые ссылки и фильтруем по ключевым словам
+    curl -sSL --max-time 15 "$API_URL" | grep '"download_url":' | awk -F '"' '{print $4}' | grep -iE "($KEYWORDS)" | while read -r url; do
+        curl -sSL --max-time 15 "$url" >> "$TEMP_FILE" 2>/dev/null
     done
 
     # 3. Обработка собранного файла
     if [[ -s "$TEMP_FILE" ]]; then
         while IFS= read -r subnet; do
-            # Очистка от пробелов и инлайн-комментариев
             subnet=$(echo "$subnet" | awk '{print $1}') 
             [[ -z "$subnet" || "$subnet" == "#"* || "$subnet" == "<"* ]] && continue
             
@@ -86,7 +82,7 @@ if [[ "$1" != "--rules-only" ]]; then
             fi
         done < "$TEMP_FILE"
 
-        # Блок защиты от соседей (+/- 500 IP)
+        # Блок защиты от соседей
         ip2int() { local a b c d; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
         int2ip() { local ui32=$1; local ip n; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
 
@@ -100,9 +96,9 @@ if [[ "$1" != "--rules-only" ]]; then
 
         ipset swap $TEMP_V4 $IPSET_V4
         ipset swap $TEMP_V6 $IPSET_V6
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы сканеров успешно обновлены и применены (SWAP)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Базы сканеров успешно обновлены (API Fetch)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Ошибка скачивания списков. Сохранены старые правила."
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Ошибка скачивания списков."
     fi
     
     ipset destroy $TEMP_V4 2>/dev/null
@@ -216,6 +212,6 @@ systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
 # 6. Применение
-echo "Скачивание баз (это займет несколько секунд) и применение правил..."
+echo "Сбор баз через API (может занять 10-15 секунд) и применение правил..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
 echo "Установка/Обновление успешно завершено!"
