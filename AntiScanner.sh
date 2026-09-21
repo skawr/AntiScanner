@@ -1,5 +1,5 @@
 #!/bin/bash
-# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.5.8 (Unbound Variable Fix, Bulletproof JSON Parsing)
+# ЕДИНЫЙ СКРИПТ УСТАНОВКИ V3.6.3 (Stable Boot, Symmetric Checks, Poison Protection)
 
 set -Eeuo pipefail
 
@@ -13,13 +13,13 @@ if ! command -v apt-get >/dev/null; then
     exit 1
 fi
 
-echo "Установка/Обновление AntiScanner V3.5.8..."
+echo "Установка/Обновление AntiScanner V3.6.3..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y ipset curl logrotate mawk iptables util-linux -qq
 
 if dpkg -l | grep -q iptables-persistent; then
-    echo "[WARN] Обнаружен iptables-persistent. Скрипт не удаляет его автоматически, чтобы не нарушить вашу конфигурацию."
+    echo "[WARN] Обнаружен iptables-persistent. Скрипт не удаляет его автоматически."
 fi
 
 cat << 'LOGROTATE_EOF' > /etc/logrotate.d/antiscanner
@@ -46,19 +46,25 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# Конфигурация
+# ================= КОНФИГУРАЦИЯ =================
 URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
+
+# Безопасные IP администратора (через пробел). Обязательно заполните для защиты от self-lockout!
+ADMIN_WHITELIST_V4="" 
+ADMIN_WHITELIST_V6=""
+
 MIN_V4_RECORDS=1000
 MAX_DROP_PERCENT=50
-MIN_V6_RECORDS=0 # Установите реальный минимум (например, 50), если IPv6-база для вас критична
+MIN_V6_RECORDS=0 
 MAX_DROP_PERCENT_V6=50
+MAX_GROWTH_MULTIPLIER=5 # Предупреждать, если база выросла более чем в 5 раз
 
-# Блокировка SNI-сканеров от соседей по дата-центру
+# Блокировка сканеров из соседних подсетей дата-центра
 ENABLE_NEIGHBOR_BLOCK=true
 NEIGHBOR_RANGE=500
 
 if (( MAX_DROP_PERCENT < 0 || MAX_DROP_PERCENT >= 100 || MAX_DROP_PERCENT_V6 < 0 || MAX_DROP_PERCENT_V6 >= 100 )); then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] MAX_DROP_PERCENT должен быть от 0 до 99." >> /var/log/antiscanner_update.log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] MAX_DROP_PERCENT и MAX_DROP_PERCENT_V6 должны быть от 0 до 99." >> /var/log/antiscanner_update.log
     exit 1
 fi
 
@@ -118,7 +124,7 @@ ensure_ipset() {
     local family=$2
     ipset create "$set_name" hash:net family "$family" hashsize 131072 maxelem 500000 2>/dev/null || true
     if ! validate_ipset_type "$set_name" "$family"; then
-        log "[ERROR] Не удалось создать или получить доступ к $set_name. Проверьте поддержку модуля ipset в ядре ОС."
+        log "[ERROR] Не удалось создать или получить доступ к $set_name. Проверьте модуль ipset."
         exit 1
     fi
 }
@@ -128,70 +134,58 @@ ensure_ipset "$IPSET_V6" inet6
 ensure_ipset "$WHITELIST_V4" inet
 ensure_ipset "$WHITELIST_V6" inet6
 
-# === ШАГ 1: БЕЛЫЙ СПИСОК (IPv4 + IPv6) ===
-ipset flush "$WHITELIST_V4" 2>/dev/null || true
-ipset flush "$WHITELIST_V6" 2>/dev/null || true
-
-VPS_GW=$(ip -4 route show default 2>/dev/null | mawk '{print $3}' | head -n1 || true)
-[[ -n "$VPS_GW" ]] && ipset add "$WHITELIST_V4" "$VPS_GW" 2>/dev/null || true
-
-VPS_GW6=$(ip -6 route show default 2>/dev/null | mawk '{print $3}' | head -n1 || true)
-if [[ "$VPS_GW6" == *:* ]]; then
-    ipset add "$WHITELIST_V6" "$VPS_GW6" 2>/dev/null || true
-fi
-
-grep nameserver /etc/resolv.conf | mawk '{print $2}' | while read -r dns; do
-    dns="${dns%%%*}"
-    if [[ "$dns" =~ : ]]; then
-        ipset add "$WHITELIST_V6" "$dns" 2>/dev/null || true
-    elif [[ "$dns" =~ \. ]]; then
-        ipset add "$WHITELIST_V4" "$dns" 2>/dev/null || true
-    fi
-done
-
-# === ШАГ 2: СКАЧИВАНИЕ И ВАЛИДАЦИЯ ИСТОЧНИКОВ ===
+# === ШАГ 1: ОБНОВЛЕНИЕ БАЗ И WHITELIST (Пропускается при --rules-only) ===
 if [[ "${1:-}" != "--rules-only" ]]; then
+    
+    # --- Построение Whitelist ---
+    ipset flush "$WHITELIST_V4" 2>/dev/null || true
+    ipset flush "$WHITELIST_V6" 2>/dev/null || true
+
+    PUB_IP_V4=$(curl -sS --max-time 3 ifconfig.me 2>/dev/null || curl -sS --max-time 3 api.ipify.org 2>/dev/null || true)
+    if [[ "$PUB_IP_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipset add "$WHITELIST_V4" "$PUB_IP_V4" 2>/dev/null || true
+    else
+        log "[WARN] Не удалось определить публичный IP. Авто-добавление в Whitelist пропущено."
+    fi
+
+    for ip in $ADMIN_WHITELIST_V4; do ipset add "$WHITELIST_V4" "$ip" 2>/dev/null || true; done
+    for ip in $ADMIN_WHITELIST_V6; do ipset add "$WHITELIST_V6" "$ip" 2>/dev/null || true; done
+
+    VPS_GW=$(ip -4 route show default 2>/dev/null | mawk '{print $3}' | head -n1 || true)
+    [[ -n "$VPS_GW" ]] && ipset add "$WHITELIST_V4" "$VPS_GW" 2>/dev/null || true
+
+    VPS_GW6=$(ip -6 route show default 2>/dev/null | mawk '{print $3}' | head -n1 || true)
+    if [[ "$VPS_GW6" == *:* ]]; then
+        ipset add "$WHITELIST_V6" "$VPS_GW6" 2>/dev/null || true
+    fi
+
+    grep nameserver /etc/resolv.conf | mawk '{print $2}' | while read -r dns; do
+        dns="${dns%%%*}"
+        if [[ "$dns" =~ : ]]; then
+            ipset add "$WHITELIST_V6" "$dns" 2>/dev/null || true
+        elif [[ "$dns" =~ \. ]]; then
+            ipset add "$WHITELIST_V4" "$dns" 2>/dev/null || true
+        fi
+    done
+
+    # --- Загрузка баз сканеров ---
     log "[INFO] Загрузка баз сканеров..."
     
     if ! curl -sSLf --user-agent "Mozilla/5.0" --max-time 30 "$URL" > "$TEMP_LIST"; then
-        log "[ERROR] Не удалось скачать Gist. Прерывание."
+        log "[ERROR] Не удалось скачать Gist. Обновление отменено."
         exit 1
     fi
     
-    GIST_V4_COUNT=$(mawk '
-    function check_ip(ip,   a) {
-        split(ip, a, ".")
-        return (a[1] <= 255 && a[2] <= 255 && a[3] <= 255 && a[4] <= 255)
-    }
-    {
-        sub(/#.*/, "")
-        sub(/<.*/, "")
-        if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) {
-            split($1, p, "/")
-            if (check_ip(p[1])) count++
-        } else if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-            split($1, p, "-")
-            if (check_ip(p[1]) && check_ip(p[2])) count++
-        }
-    }
-    END { print count+0 }
-    ' "$TEMP_LIST")
-
-    if (( GIST_V4_COUNT == 0 )); then
-        log "[ERROR] База Gist не содержит валидных IPv4 адресов. Прерывание."
-        exit 1
-    fi
-
     API_URL="https://api.github.com/repos/OpenFilters/internet-scanners/contents/cidr"
     KEYWORDS="censys|shodan|paloalto|shadowserver|driftnet|onyphe|zoomeye|leakix|rapid7|fofa|quake"
     
-    HTTP_CODE=$(curl -sSL -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.5.8" --max-time 15 "$API_URL" || true)
+    HTTP_CODE=$(curl -sSL -o "$API_RESP" -w "%{http_code}" -H "User-Agent: AntiScanner-V3.6.3" --max-time 15 "$API_URL" || true)
     if [[ "$HTTP_CODE" == "200" ]]; then
         SUCCESS_DL=0
         FAIL_DL=0
         
         while read -r url; do
-            if curl -sSLf -H "User-Agent: AntiScanner-V3.5.8" --max-time 15 "$url" > "$TMP_DL"; then
+            if curl -sSLf -H "User-Agent: AntiScanner-V3.6.3" --max-time 15 "$url" > "$TMP_DL"; then
                 cat "$TMP_DL" >> "$TEMP_LIST"
                 ((SUCCESS_DL+=1))
             else
@@ -205,51 +199,58 @@ if [[ "${1:-}" != "--rules-only" ]]; then
         log "[WARN] GitHub API недоступен (Код $HTTP_CODE). Используется только Gist."
     fi
 
-    # === ШАГ 3: ПОДГОТОВКА СЕТОВ И МАТЕМАТИКА СОСЕДЕЙ ===
+    # --- Подготовка сетов, Poison Protection и Соседи ---
     ipset destroy "$TEMP_V4" 2>/dev/null || true
     ipset destroy "$TEMP_V6" 2>/dev/null || true
     ipset create "$TEMP_V4" hash:net family inet hashsize 131072 maxelem 500000
     ipset create "$TEMP_V6" hash:net family inet6 hashsize 131072 maxelem 500000
 
     mawk '
-    function check_ip(ip,   a) {
+    function is_valid_v4(ip, mask,   a) {
         split(ip, a, ".")
-        return (a[1] <= 255 && a[2] <= 255 && a[3] <= 255 && a[4] <= 255)
+        if (a[1] > 255 || a[2] > 255 || a[3] > 255 || a[4] > 255) return 0
+        if (a[1] == 10 || a[1] == 127 || a[1] == 0 || a[1] >= 224) return 0
+        if (a[1] == 192 && a[2] == 168) return 0
+        if (a[1] == 172 && a[2] >= 16 && a[2] <= 31) return 0
+        if (a[1] == 100 && a[2] >= 64 && a[2] <= 127) return 0 # CGNAT
+        if (a[1] == 169 && a[2] == 254) return 0 # Link-local
+        if (a[1] == 198 && a[2] >= 18 && a[2] <= 19) return 0 # RFC 2544
+        if (mask != "" && mask < 8) return 0
+        return 1
     }
     {
         sub(/#.*/, "")
         sub(/<.*/, "")
         if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) {
             split($1, p, "/")
-            if (check_ip(p[1])) print "add '"$TEMP_V4"' " $1
+            if (is_valid_v4(p[1], p[2])) print "add '"$TEMP_V4"' " $1
         } else if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
             split($1, p, "-")
-            if (check_ip(p[1]) && check_ip(p[2])) print "add '"$TEMP_V4"' " $1
+            if (is_valid_v4(p[1], "") && is_valid_v4(p[2], "")) print "add '"$TEMP_V4"' " $1
         } else if ($1 ~ /^[0-9A-Fa-f:]+(\/[0-9]+)?$/) {
+            split($1, p, "/")
+            if (p[2] != "" && p[2] < 32) next
             print "add '"$TEMP_V6"' " $1
         }
     }' "$TEMP_LIST" > "$RESTORE_FILE"
 
-    if [ "$ENABLE_NEIGHBOR_BLOCK" = true ]; then
+    if [ "$ENABLE_NEIGHBOR_BLOCK" = true ] && [[ "$PUB_IP_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         ip2int() { local a=0 b=0 c=0 d=0; IFS=. read a b c d <<< "$1"; echo $((a * 256**3 + b * 256**2 + c * 256 + d)); }
         int2ip() { local ui32=$1; local ip="" n=0; for n in 1 2 3 4; do ip=$((ui32 & 0xff))${ip:+.}$ip; ui32=$((ui32 >> 8)); done; echo $ip; }
 
-        VPS_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)
-        if [[ -n "$VPS_IP" ]]; then
-            IP_INT=$(ip2int "$VPS_IP")
-            START_INT=$((IP_INT - NEIGHBOR_RANGE))
-            END_INT=$((IP_INT + NEIGHBOR_RANGE))
-            
-            (( START_INT < 0 )) && START_INT=0
-            (( END_INT > 4294967295 )) && END_INT=4294967295
+        IP_INT=$(ip2int "$PUB_IP_V4")
+        START_INT=$((IP_INT - NEIGHBOR_RANGE))
+        END_INT=$((IP_INT + NEIGHBOR_RANGE))
+        
+        (( START_INT < 0 )) && START_INT=0
+        (( END_INT > 4294967295 )) && END_INT=4294967295
 
-            START_IP=$(int2ip $START_INT)
-            END_IP=$(int2ip $END_INT)
-            echo "add $TEMP_V4 $START_IP-$END_IP" >> "$RESTORE_FILE"
-        fi
+        START_IP=$(int2ip $START_INT)
+        END_IP=$(int2ip $END_INT)
+        echo "add $TEMP_V4 $START_IP-$END_IP" >> "$RESTORE_FILE"
     fi
 
-    # === ШАГ 4: ДВУХФАЗНАЯ ЗАМЕНА С КОМПЕНСАЦИОННЫМ ОТКАТОМ ===
+    # --- ШАГ 4: ДВУХФАЗНАЯ ЗАМЕНА С КОНТРОЛЕМ ЛИМИТОВ ---
     OLD_V4_COUNT=$(ipset list "$IPSET_V4" 2>/dev/null | mawk '/Number of entries:/ {print $4}' || echo 0)
     OLD_V6_COUNT=$(ipset list "$IPSET_V6" 2>/dev/null | mawk '/Number of entries:/ {print $4}' || echo 0)
     
@@ -259,30 +260,40 @@ if [[ "${1:-}" != "--rules-only" ]]; then
         [[ -z "$ACTUAL_V4_COUNT" ]] && ACTUAL_V4_COUNT=0
         [[ -z "$ACTUAL_V6_COUNT" ]] && ACTUAL_V6_COUNT=0
 
+        # Хард-лимиты (Минимум)
         if (( ACTUAL_V4_COUNT < MIN_V4_RECORDS )); then
-            log "[ERROR] Размер IPv4 базы ($ACTUAL_V4_COUNT) ниже минимума ($MIN_V4_RECORDS). Откат."
+            log "[ERROR] Размер IPv4 базы ($ACTUAL_V4_COUNT) ниже минимума ($MIN_V4_RECORDS). Обновление отменено."
             exit 1
         fi
         if (( ACTUAL_V6_COUNT < MIN_V6_RECORDS )); then
-            log "[ERROR] Размер IPv6 базы ($ACTUAL_V6_COUNT) ниже минимума ($MIN_V6_RECORDS). Откат."
-            exit 1
+            log "[WARN] Размер IPv6 базы ($ACTUAL_V6_COUNT) равен или ниже минимума ($MIN_V6_RECORDS)."
         fi
 
+        # Софт-лимиты (Сжатие)
         if (( OLD_V4_COUNT > MIN_V4_RECORDS )); then
             MIN_ALLOWED_V4=$(( OLD_V4_COUNT * (100 - MAX_DROP_PERCENT) / 100 ))
             if (( ACTUAL_V4_COUNT < MIN_ALLOWED_V4 )); then
-                log "[ERROR] Аномальное падение IPv4 базы: $OLD_V4_COUNT -> $ACTUAL_V4_COUNT (минимум $MIN_ALLOWED_V4). Откат."
+                log "[ERROR] Аномальное падение IPv4 базы: $OLD_V4_COUNT -> $ACTUAL_V4_COUNT. Обновление отменено."
                 exit 1
             fi
         fi
         if (( OLD_V6_COUNT > MIN_V6_RECORDS )); then
             MIN_ALLOWED_V6=$(( OLD_V6_COUNT * (100 - MAX_DROP_PERCENT_V6) / 100 ))
             if (( ACTUAL_V6_COUNT < MIN_ALLOWED_V6 )); then
-                log "[ERROR] Аномальное падение IPv6 базы: $OLD_V6_COUNT -> $ACTUAL_V6_COUNT (минимум $MIN_ALLOWED_V6). Откат."
+                log "[ERROR] Аномальное падение IPv6 базы: $OLD_V6_COUNT -> $ACTUAL_V6_COUNT. Обновление отменено."
                 exit 1
             fi
         fi
 
+        # Контроль аномального роста (Только Warning)
+        if (( OLD_V4_COUNT > MIN_V4_RECORDS && ACTUAL_V4_COUNT > OLD_V4_COUNT * MAX_GROWTH_MULTIPLIER )); then
+            log "[WARN] Аномальный рост IPv4 базы: $OLD_V4_COUNT -> $ACTUAL_V4_COUNT. Проверьте источник на наличие мусора."
+        fi
+        if (( OLD_V6_COUNT > MIN_V6_RECORDS && ACTUAL_V6_COUNT > OLD_V6_COUNT * MAX_GROWTH_MULTIPLIER )); then
+            log "[WARN] Аномальный рост IPv6 базы: $OLD_V6_COUNT -> $ACTUAL_V6_COUNT. Проверьте источник на наличие мусора."
+        fi
+
+        # Атомарный Swap
         if ipset swap "$TEMP_V4" "$IPSET_V4"; then
             if ipset swap "$TEMP_V6" "$IPSET_V6"; then
                 log "[SUCCESS] Двухфазная замена завершена. IPv4: $ACTUAL_V4_COUNT, IPv6: $ACTUAL_V6_COUNT."
@@ -304,9 +315,9 @@ if [[ "${1:-}" != "--rules-only" ]]; then
         log "[ERROR] ipset restore failed. Отмена."
         exit 1
     fi
-fi
+fi # КОНЕЦ БЛОКА ОБНОВЛЕНИЯ БАЗ
 
-# === ШАГ 5: МИГРАЦИЯ И УПРАВЛЕНИЕ ПРАВИЛАМИ IPTABLES ===
+# === ШАГ 5: МИГРАЦИЯ И УПРАВЛЕНИЕ ПРАВИЛАМИ IPTABLES (Выполняется всегда) ===
 clean_legacy_jumps() {
     local chain=$1
     local cmd=$2
@@ -352,7 +363,9 @@ for cmd in iptables ip6tables; do
 done
 
 for cmd in iptables ip6tables; do
+    # ПОРЯДОК КРИТИЧЕН ДЛЯ ПРЕДОТВРАЩЕНИЯ SELF-LOCKOUT
     $cmd -A "$CHAIN_MAIN" -i lo -j ACCEPT
+    $cmd -A "$CHAIN_MAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     
     if [ "$cmd" = "iptables" ]; then
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$WHITELIST_V4" src -j ACCEPT
@@ -364,7 +377,6 @@ for cmd in iptables ip6tables; do
         $cmd -A "$CHAIN_MAIN" -m set --match-set "$IPSET_V6" src -j DROP
     fi
 
-    $cmd -A "$CHAIN_MAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     $cmd -A "$CHAIN_MAIN" -j RETURN
 done
 
@@ -389,33 +401,40 @@ EOF
 chmod +x "$SCRIPT_PATH"
 
 # === Настройка Cron и Systemd ===
-crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
 C_JOB="20 3 * * * $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1"
-(crontab -l 2>/dev/null; echo "$C_JOB") | crontab -
+CURRENT_CRONTAB=$(crontab -l 2>/dev/null || true)
+printf '%s\n' "$CURRENT_CRONTAB" | grep -vF "$SCRIPT_PATH" | { cat; echo "$C_JOB"; } | crontab -
 
-mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/ufw.service.d
-echo -e "[Service]\nExecStartPost=-/bin/bash -c '$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1'" > /etc/systemd/system/docker.service.d/antiscanner-hook.conf
-echo -e "[Service]\nExecStartPost=-/bin/bash -c '$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1'" > /etc/systemd/system/ufw.service.d/antiscanner-hook.conf
-
-cat << EOF_SYS > /etc/systemd/system/antiscanner-update.service
+cat << 'EOF_SYS' > /etc/systemd/system/antiscanner-update.service
 [Unit]
 Description=Update AntiScanner Blocklist on Boot
-After=network.target ufw.service docker.service
+Wants=network-online.target
+After=network-online.target nss-lookup.target ufw.service docker.service
 
 [Service]
 Type=oneshot
-ExecStart=$SCRIPT_PATH
-StandardOutput=append:/var/log/antiscanner_update.log
-StandardError=append:/var/log/antiscanner_update.log
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/bash -c '/usr/local/bin/update-antiscanner.sh >> /var/log/antiscanner_update.log 2>&1'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF_SYS
 
+mkdir -p /etc/systemd/system/docker.service.d /etc/systemd/system/ufw.service.d
+echo -e "[Service]\nExecStartPost=-/bin/bash -c '$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1'" > /etc/systemd/system/docker.service.d/antiscanner-hook.conf
+echo -e "[Service]\nExecStartPost=-/bin/bash -c '$SCRIPT_PATH --rules-only >> /var/log/antiscanner_update.log 2>&1'" > /etc/systemd/system/ufw.service.d/antiscanner-hook.conf
+
 systemctl daemon-reload
 systemctl enable antiscanner-update.service &>/dev/null
 
-echo "Запуск обновления V3.5.8..."
+echo "Запуск обновления V3.6.3..."
 $SCRIPT_PATH >> /var/log/antiscanner_update.log 2>&1
-echo "Установка AntiScanner V3.5.8 завершена!"
+
+echo "=========================================================================="
+echo -e "\033[1;33m[ВАЖНО] Установка AntiScanner V3.6.3 успешно завершена!\033[0m"
+echo "Настоятельно рекомендуется открыть скрипт:"
+echo "  nano $SCRIPT_PATH"
+echo "и вписать ваш резервный IP в переменную ADMIN_WHITELIST_V4."
+echo "Это гарантирует доступ к серверу даже при сбоях внешней детекции IP."
+echo "=========================================================================="
